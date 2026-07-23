@@ -365,6 +365,9 @@ func (s *Server) Handler() http.Handler {
 		if r.URL.Query().Get("nonterminal") != "" {
 			q += ` AND state IN ('ready','submitting','submitted')`
 		}
+		if r.URL.Query().Get("reconcilable") != "" {
+			q += ` AND state IN ('ready','submitting','submitted','needs_review')`
+		}
 		if ss := r.URL.Query().Get("stale_seconds"); ss != "" {
 			args = append(args, ss)
 			q += ` AND updated_at < now() - ($` + strconv.Itoa(len(args)) + ` || ' seconds')::interval`

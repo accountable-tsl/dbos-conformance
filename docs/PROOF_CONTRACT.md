@@ -32,10 +32,13 @@ single external effect.
 | Schedule downtime | `schedule-downtime.sh` | Work that becomes due while the application is stopped is recovered by a later scheduled reconciliation; repeated occurrences still create one workflow/effect. |
 | Code upgrade | `code-upgrade.sh` | A separately built v2 worker resumes v1 history without inserting its new patched step; newly started work takes the patch path. |
 | DBOS database loss | `dbos-database-loss.sh` | A stale restore and an empty DBOS database are reconciled from Accountable. Existing provider effects are adopted, histories present in the backup survive, and a second reconciliation is clean. |
+| Late review resolution | `late-resolution.sh` | A workflow first records `needs_review`; later provider completion moves Accountable to `accepted` exactly once through both operator and scheduled reconciliation without another provider POST. |
+| Reconciliation health | `reconciliation-health.sh` | Operator and scheduled reconciliation recreate repairable `ERROR` histories, preserve and escalate `CANCELLED` or stale active histories, and inspect provider state before trusting `SUCCESS`. |
 
 ## Timing modes
 
-Both modes run the table above.
+Both modes run the table above and write a JSON report with the commit SHA,
+DBOS version, timing mode, suite result, and each scenario's result and duration.
 
 - `fast` compresses provider delays, HTTP timeouts, retry intervals, stale-record
   thresholds and schedule intervals. It is intended for development feedback.

@@ -19,6 +19,13 @@ jobs:
           cache-dependency-path: go.sum
       - name: Run all proofs with full timings
         run: make check-full
+      - name: Upload evidence report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dbos-lab-report
+          path: artifacts/dbos-lab-report.json
+          if-no-files-found: error
       - name: Stop lab infrastructure
         if: always()
         run: make down

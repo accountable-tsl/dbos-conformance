@@ -336,9 +336,13 @@ func recordOutcome(ctx dbos.DBOSContext, canonID string, in domain.FilingInput, 
 		domain.StateRejected:    "MarkFilingRejected",
 		domain.StateNeedsReview: "MarkFilingNeedsReview",
 	}[state]
+	commandKey := domain.OutcomeCommandKey(canonID)
+	if state == domain.StateNeedsReview {
+		commandKey = domain.ReviewCommandKey(canonID)
+	}
 	_, err := dbos.RunAsStep(ctx, func(c context.Context) (*accountable.CommandResult, error) {
 		out, err := acct.ApplyCommand(c, accountable.CommandRequest{
-			IdempotencyKey: domain.OutcomeCommandKey(canonID),
+			IdempotencyKey: commandKey,
 			CommandType:    cmdType,
 			FilingID:       in.FilingID,
 			TaxYear:        in.TaxYear,
@@ -356,15 +360,90 @@ func recordOutcome(ctx dbos.DBOSContext, canonID string, in domain.FilingInput, 
 // when healthy and a reconstruction mechanism after runtime loss.
 func Reconcile(ctx dbos.DBOSContext, scheduledAt time.Time) (string, error) {
 	stale, err := dbos.RunAsStep(ctx, func(c context.Context) ([]accountable.Filing, error) {
-		return acct.ListFilings(c, fmt.Sprintf("nonterminal=1&stale_seconds=%d", cfg.ReconcileStaleSeconds))
+		return acct.ListFilings(c, fmt.Sprintf("reconcilable=1&stale_seconds=%d", cfg.ReconcileStaleSeconds))
 	}, dbos.WithStepName("fetchDueRecords"), dbos.WithStepMaxRetries(3))
 	if err != nil {
 		return "", err
 	}
 	started := 0
+	finalized := 0
+	recreated := 0
+	escalated := 0
 	for _, f := range stale {
 		wfID := domain.WorkflowID(f.FilingID, f.TaxYear)
-		_, err := dbos.RunWorkflow(ctx, Filing, domain.FilingInput{
+		if f.State == domain.StateNeedsReview {
+			status, err := dbos.RunAsStep(ctx, func(c context.Context) (authority.StatusResponse, error) {
+				return auth.Status(c, domain.ProviderOperationID(f.FilingID, f.TaxYear))
+			}, dbos.WithStepName("resolveReviewedProvider"), dbos.WithStepMaxRetries(3))
+			if err != nil {
+				return "", err
+			}
+			if status.Status != "completed" {
+				escalated++
+				continue
+			}
+			state := mapOutcome(status.Outcome)
+			if state == domain.StateNeedsReview {
+				escalated++
+				continue
+			}
+			if err := recordOutcome(ctx, wfID, domain.FilingInput{
+				FilingID: f.FilingID, TaxYear: f.TaxYear, Scenario: f.Scenario,
+			}, state, "resolved by scheduled reconciliation"); err != nil {
+				return "", err
+			}
+			finalized++
+			continue
+		}
+		wfs, err := dbos.ListWorkflows(ctx, dbos.WithWorkflowIDs([]string{wfID}))
+		if err != nil {
+			return "", err
+		}
+		if len(wfs) > 0 {
+			switch wfs[0].Status {
+			case dbos.WorkflowStatusCancelled:
+				escalated++
+				continue
+			case dbos.WorkflowStatusPending, dbos.WorkflowStatusEnqueued:
+				if scheduledAt.Sub(wfs[0].UpdatedAt) >= time.Duration(cfg.ReconcileStaleSeconds)*time.Second {
+					escalated++
+				}
+				continue
+			case dbos.WorkflowStatusDelayed:
+				if !scheduledAt.Before(wfs[0].DelayUntil.Add(time.Duration(cfg.ReconcileStaleSeconds) * time.Second)) {
+					escalated++
+				}
+				continue
+			case dbos.WorkflowStatusSuccess:
+				status, err := dbos.RunAsStep(ctx, func(c context.Context) (authority.StatusResponse, error) {
+					return auth.Status(c, domain.ProviderOperationID(f.FilingID, f.TaxYear))
+				}, dbos.WithStepName("inspectSuccessfulProvider"), dbos.WithStepMaxRetries(3))
+				if err != nil {
+					return "", err
+				}
+				state := mapOutcome(status.Outcome)
+				if status.Status != "completed" || state == domain.StateNeedsReview {
+					escalated++
+					continue
+				}
+				if err := recordOutcome(ctx, wfID, domain.FilingInput{
+					FilingID: f.FilingID, TaxYear: f.TaxYear, Scenario: f.Scenario,
+				}, state, "resolved by scheduled reconciliation"); err != nil {
+					return "", err
+				}
+				finalized++
+				continue
+			case dbos.WorkflowStatusError:
+				if err := dbos.DeleteWorkflows(ctx, []string{wfID}); err != nil {
+					return "", err
+				}
+				recreated++
+			default:
+				escalated++
+				continue
+			}
+		}
+		_, err = dbos.RunWorkflow(ctx, Filing, domain.FilingInput{
 			FilingID: f.FilingID, TaxYear: f.TaxYear, Scenario: f.Scenario,
 		}, dbos.WithWorkflowID(wfID), dbos.WithQueue(QueueName))
 		if err != nil {
@@ -376,5 +455,6 @@ func Reconcile(ctx dbos.DBOSContext, scheduledAt time.Time) (string, error) {
 		}
 		started++
 	}
-	return fmt.Sprintf("checked=%d started=%d at=%s", len(stale), started, scheduledAt.Format(time.RFC3339)), nil
+	return fmt.Sprintf("checked=%d started=%d recreated=%d finalized=%d escalated=%d at=%s",
+		len(stale), started, recreated, finalized, escalated, scheduledAt.Format(time.RFC3339)), nil
 }

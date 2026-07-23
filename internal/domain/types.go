@@ -59,6 +59,7 @@ func ProviderOperationID(filingID string, taxYear int) string {
 // Stable command keys make replay and reconstruction reuse the original effect.
 func SubmittedCommandKey(workflowID string) string { return workflowID + "-submitted" }
 func OutcomeCommandKey(workflowID string) string   { return workflowID + "-outcome" }
+func ReviewCommandKey(workflowID string) string    { return workflowID + "-needs-review" }
 func SubmissionIntentCommandKey(operationID string) string {
 	return operationID + "-submission-intent"
 }

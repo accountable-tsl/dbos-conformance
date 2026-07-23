@@ -4,7 +4,7 @@ This is a disposable lab for deciding whether `dbos-transact-golang v0.20.0`
 can support the failure modes we care about. It is not a production service or
 a release pipeline.
 
-The lab answers nine questions:
+The lab answers eleven questions:
 
 1. Do duplicate starts create one logical operation?
 2. Does a workflow recover after a crash around every durable step?
@@ -15,6 +15,8 @@ The lab answers nine questions:
 7. Does scheduled reconciliation recover work created during downtime?
 8. Does an in-flight workflow survive a compatible code upgrade?
 9. Can runtime state be restored or reconstructed after DBOS database loss?
+10. Can a provider outcome resolve `needs_review` later without conflicting with the earlier command?
+11. Does reconciliation distinguish missing, failed, cancelled, stale and incorrectly successful workflows?
 
 Each question has one scenario in [`scenarios/`](scenarios). The required
 provider guarantees and the exact evidence are in
@@ -32,7 +34,9 @@ make check-full
 `make check` is the normal feedback loop. It changes timings, not coverage.
 `make check-full` preserves the longer delays needed to observe realistic
 timeouts, backoff, late callbacks and missed schedule ticks. A manually
-triggered GitHub Actions workflow is also available for the full run.
+triggered GitHub Actions workflow is also available for the full run. Both
+checks write `artifacts/dbos-lab-report.json`; CI uploads that file even when a
+scenario fails.
 
 Every scenario resets the three lab databases and Kafka state. Do not point
 these commands at data you care about. You can run one proof directly, for
@@ -57,7 +61,7 @@ Redpanda event -> DBOS workflow -> Accountable submission intent
 - `cmd/worker` contains the DBOS workflow, event consumer and callback endpoint.
 - `cmd/accountable` is the fake authoritative product service.
 - `cmd/authority` is a fake provider with a durable idempotency/status ledger.
-- `cmd/opsctl` exposes only the operations needed by the nine proofs.
+- `cmd/opsctl` exposes only the operations needed by the proofs.
 - `internal/chaos` kills the worker at named durability boundaries.
 
 DBOS owns only its runtime database. Accountable remains the source of business

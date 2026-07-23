@@ -14,6 +14,7 @@ import (
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
 
 	"github.com/accountable/dbos-conformance/internal/accountable"
+	"github.com/accountable/dbos-conformance/internal/authority"
 	"github.com/accountable/dbos-conformance/internal/domain"
 	"github.com/accountable/dbos-conformance/internal/workflow"
 )
@@ -28,7 +29,7 @@ const usage = `opsctl — operator CLI for the DBOS conformance spike
                                                  manually deliver a lost callback
   start     <filing-id> [-year Y] [-scenario S] [-version V]
                                                  enqueue one deterministic filing workflow
-  reconcile [-apply]                             diff accountable vs DBOS; recreate missing
+  reconcile [-apply] [-stale-seconds N]          compare Accountable, DBOS and provider state
 `
 
 func main() {
@@ -124,12 +125,13 @@ func main() {
 
 	case "reconcile":
 		fs := flag.NewFlagSet("reconcile", flag.ExitOnError)
-		apply := fs.Bool("apply", false, "recreate missing workflows (default: report only)")
+		apply := fs.Bool("apply", false, "apply safe reconciliation actions (default: report only)")
+		staleSeconds := fs.Int("stale-seconds", 30, "age after which an active workflow requires investigation")
 		// DBOS workers only dequeue their own application version, so an
 		// unstamped reconstruction would remain ENQUEUED forever.
 		version := fs.String("version", envOr("APP_VERSION", "v1"), "application version of the worker fleet that must run the recreated workflows")
 		check(fs.Parse(args))
-		reconcile(client, *apply, *version)
+		reconcile(client, *apply, *version, time.Duration(*staleSeconds)*time.Second)
 
 	default:
 		fmt.Print(usage)
@@ -183,12 +185,16 @@ func enqueueFiling(client dbos.Client, wfID string, requested domain.FilingInput
 	return nil
 }
 
-func reconcile(client dbos.Client, apply bool, appVersion string) {
+func reconcile(client dbos.Client, apply bool, appVersion string, staleAfter time.Duration) {
 	acct := &accountable.Client{
 		BaseURL: envOr("ACCOUNTABLE_URL", "http://localhost:8081"),
 		HTTP:    &http.Client{Timeout: 5 * time.Second},
 	}
-	filings, err := acct.ListFilings(context.Background(), "nonterminal=1")
+	auth := &authority.Client{
+		BaseURL: envOr("AUTHORITY_URL", "http://localhost:8082"),
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+	filings, err := acct.ListFilings(context.Background(), "reconcilable=1")
 	check(err)
 	if len(filings) == 0 {
 		fmt.Println("no non-terminal filings — nothing to reconcile")
@@ -199,8 +205,106 @@ func reconcile(client dbos.Client, apply bool, appVersion string) {
 		wfID := domain.WorkflowID(f.FilingID, f.TaxYear)
 		wfs, err := client.ListWorkflows(dbos.WithWorkflowIDs([]string{wfID}))
 		check(err)
+		if f.State == domain.StateNeedsReview {
+			status, err := auth.Status(context.Background(), domain.ProviderOperationID(f.FilingID, f.TaxYear))
+			check(err)
+			if status.Status != "completed" {
+				dbosStatus := "MISSING"
+				if len(wfs) > 0 {
+					dbosStatus = string(wfs[0].Status)
+				}
+				fmt.Printf("ESCALATE %-38s dbos_status=%s provider_status=%s reason=outcome_unresolved\n",
+					wfID, dbosStatus, status.Status)
+				continue
+			}
+			commandType, valid := finalCommandType(status.Outcome)
+			if !valid {
+				fmt.Printf("ESCALATE %-38s provider_status=completed provider_outcome=%s reason=unknown_outcome\n",
+					wfID, status.Outcome)
+				continue
+			}
+			if !apply {
+				fmt.Printf("FINAL   %-40s provider_outcome=%s (run with -apply to record)\n", wfID, status.Outcome)
+				continue
+			}
+			_, err = acct.ApplyCommand(context.Background(), accountable.CommandRequest{
+				IdempotencyKey: domain.OutcomeCommandKey(wfID),
+				CommandType:    commandType,
+				FilingID:       f.FilingID,
+				TaxYear:        f.TaxYear,
+				Detail:         "resolved from completed provider operation",
+			})
+			check(err)
+			fmt.Printf("FINALIZED %-38s provider_outcome=%s\n", wfID, status.Outcome)
+			continue
+		}
 		if len(wfs) > 0 {
-			fmt.Printf("OK      %-40s dbos_status=%s\n", wfID, wfs[0].Status)
+			if wfs[0].Status == dbos.WorkflowStatusPending || wfs[0].Status == dbos.WorkflowStatusEnqueued {
+				age := time.Since(wfs[0].UpdatedAt)
+				if age >= staleAfter {
+					fmt.Printf("ESCALATE %-38s dbos_status=%s reason=stale_active age=%s\n",
+						wfID, wfs[0].Status, age.Round(time.Second))
+				} else {
+					fmt.Printf("OK      %-40s dbos_status=%s\n", wfID, wfs[0].Status)
+				}
+				continue
+			}
+			if wfs[0].Status == dbos.WorkflowStatusDelayed {
+				if time.Now().Before(wfs[0].DelayUntil.Add(staleAfter)) {
+					fmt.Printf("OK      %-40s dbos_status=%s\n", wfID, wfs[0].Status)
+				} else {
+					fmt.Printf("ESCALATE %-38s dbos_status=%s reason=overdue_delay\n", wfID, wfs[0].Status)
+				}
+				continue
+			}
+			if wfs[0].Status == dbos.WorkflowStatusCancelled {
+				fmt.Printf("ESCALATE %-38s dbos_status=%s reason=cancelled_requires_operator\n",
+					wfID, wfs[0].Status)
+				continue
+			}
+			if wfs[0].Status == dbos.WorkflowStatusError {
+				if !apply {
+					fmt.Printf("RECREATE %-39s dbos_status=%s (run with -apply to recreate)\n", wfID, wfs[0].Status)
+					continue
+				}
+				err := client.DeleteWorkflows([]string{wfID})
+				check(err)
+				_, err = client.Enqueue(workflow.QueueName, workflow.FilingWorkflowName,
+					domain.FilingInput{FilingID: f.FilingID, TaxYear: f.TaxYear, Scenario: f.Scenario},
+					dbos.WithEnqueueWorkflowID(wfID),
+					dbos.WithEnqueueApplicationVersion(appVersion))
+				check(err)
+				fmt.Printf("RECREATED %-38s from dbos_status=%s\n", wfID, wfs[0].Status)
+				continue
+			}
+			if wfs[0].Status == dbos.WorkflowStatusSuccess {
+				status, err := auth.Status(context.Background(), domain.ProviderOperationID(f.FilingID, f.TaxYear))
+				check(err)
+				commandType, valid := finalCommandType(status.Outcome)
+				if status.Status != "completed" || !valid {
+					fmt.Printf("ESCALATE %-38s dbos_status=%s provider_status=%s reason=successful_history_without_outcome\n",
+						wfID, wfs[0].Status, status.Status)
+					continue
+				}
+				if !apply {
+					fmt.Printf("FINAL   %-40s dbos_status=%s provider_outcome=%s (run with -apply to record)\n",
+						wfID, wfs[0].Status, status.Outcome)
+					continue
+				}
+				_, err = acct.ApplyCommand(context.Background(), accountable.CommandRequest{
+					IdempotencyKey: domain.OutcomeCommandKey(wfID),
+					CommandType:    commandType,
+					FilingID:       f.FilingID,
+					TaxYear:        f.TaxYear,
+					Detail:         "resolved from completed provider operation",
+				})
+				check(err)
+				fmt.Printf("FINALIZED %-38s dbos_status=%s provider_outcome=%s\n",
+					wfID, wfs[0].Status, status.Outcome)
+				continue
+			}
+			fmt.Printf("ESCALATE %-38s dbos_status=%s reason=unsupported_terminal_status\n",
+				wfID, wfs[0].Status)
 			continue
 		}
 		missing++
@@ -216,6 +320,17 @@ func reconcile(client dbos.Client, apply bool, appVersion string) {
 		fmt.Printf("RECREATED %-40s from accountable_state=%s\n", wfID, f.State)
 	}
 	fmt.Printf("reconcile complete: %d filings checked, %d missing\n", len(filings), missing)
+}
+
+func finalCommandType(outcome string) (string, bool) {
+	switch outcome {
+	case "accepted":
+		return "MarkFilingAccepted", true
+	case "rejected":
+		return "MarkFilingRejected", true
+	default:
+		return "", false
+	}
 }
 
 func requireArg(args []string, name string) {
