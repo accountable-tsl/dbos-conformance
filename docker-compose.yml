@@ -1,0 +1,79 @@
+name: dbos-conformance
+
+services:
+  # Isolation allows runtime state to be destroyed without touching product truth.
+  dbos-postgres:
+    image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dbos
+      POSTGRES_DB: dbos
+    ports:
+      - "5344:5432"
+    volumes:
+      - dbos-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  # Isolation prevents workflow churn or runtime failure from corrupting product truth.
+  accountable-postgres:
+    image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: accountable
+      POSTGRES_DB: accountable
+    ports:
+      - "5434:5432"
+    volumes:
+      - accountable-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  # Independence preserves provider truth while DBOS state is deliberately lost.
+  authority-postgres:
+    image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: authority
+      POSTGRES_DB: authority
+    ports:
+      - "5444:5432"
+    volumes:
+      - authority-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7@sha256:82a69763bef8d8b55ea5a520fa1b38f993908ef68946819ca1aed43541824c48
+    container_name: dbos-conformance-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --set redpanda.auto_create_topics_enabled=true
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  dbos-pgdata:
+  accountable-pgdata:
+  authority-pgdata:
